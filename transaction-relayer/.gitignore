@@ -1,1 +1,4 @@
 /target
+keypair.json
+signing_key.pem
+verifying_key.pem
