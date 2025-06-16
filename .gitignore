@@ -10,3 +10,8 @@
 
 .env
 docker-output/
+
+# Authentication keys (generated locally)
+keypair.json
+signing_key.pem
+verifying_key.pem
