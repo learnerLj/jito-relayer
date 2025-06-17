@@ -1,3 +1,36 @@
+//! High-performance transaction packet relayer for Jito MEV infrastructure.
+//! 
+//! This module implements the core packet forwarding service that routes transaction
+//! packets from the TPU to subscribed validators based on leader schedule and connection status.
+//! 
+//! ## Architecture Overview
+//! 
+//! ```text
+//! TPU Packets → [OFAC Filter] → [Leader Filter] → [Connected Validators]
+//!     ↓              ↓               ↓                     ↓
+//! Transaction    Regulatory     Leader Schedule      gRPC Streams
+//! Packets        Compliance     Routing Logic       to Validators
+//! ```
+//! 
+//! ## Key Components
+//! 
+//! ### Packet Processing Pipeline
+//! 1. **Packet Reception**: Receives verified transaction packets from TPU
+//! 2. **OFAC Filtering**: Drops packets involving sanctioned addresses (if enabled)
+//! 3. **Leader-based Routing**: Forwards packets only to current/upcoming slot leaders
+//! 4. **Connection Management**: Maintains gRPC streams to authenticated validators
+//! 
+//! ### Subscription Management
+//! - Validators authenticate and subscribe to packet streams
+//! - Health-based connection dropping when relayer is unhealthy
+//! - Automatic cleanup of disconnected validator streams
+//! 
+//! ### Performance Features
+//! - Configurable packet batching for throughput optimization
+//! - Comprehensive metrics collection and reporting
+//! - Non-blocking channel operations to prevent stalls
+//! - Efficient crossbeam-based event loop for high performance
+
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     net::IpAddr,
@@ -39,37 +72,73 @@ use tonic::{Request, Response, Status};
 
 use crate::{health_manager::HealthState, schedule_cache::LeaderScheduleUpdatingHandle};
 
+/// Statistics tracking for packet forwarding to individual validators.
+/// 
+/// These metrics help monitor relayer performance and identify validators
+/// with connection or capacity issues.
 #[derive(Default)]
 struct PacketForwardStats {
+    /// Total number of packet batches successfully forwarded to this validator
     num_packets_forwarded: u64,
+    /// Total number of packet batches dropped due to channel capacity issues
     num_packets_dropped: u64,
 }
 
+/// Comprehensive metrics collection for relayer performance monitoring.
+/// 
+/// These metrics are reported periodically to help operators monitor:
+/// - System health and performance
+/// - Validator connection status
+/// - Packet processing latencies
+/// - Channel utilization and bottlenecks
 struct RelayerMetrics {
+    /// Highest slot number seen from the network (indicates connectivity)
     pub highest_slot: u64,
+    /// Number of new validator connections established this period
     pub num_added_connections: u64,
+    /// Number of validator connections dropped this period
     pub num_removed_connections: u64,
+    /// Current number of active validator connections
     pub num_current_connections: u64,
+    /// Number of heartbeat messages sent this period
     pub num_heartbeats: u64,
+    /// Maximum latency observed for heartbeat processing (microseconds)
     pub max_heartbeat_tick_latency_us: u64,
+    /// Time taken to collect and report metrics (microseconds)
     pub metrics_latency_us: u64,
+    /// Number of channel send failures due to full channels
     pub num_try_send_channel_full: u64,
+    /// Distribution of packet processing latencies from TPU to validator
     pub packet_latencies_us: Histogram,
 
+    // Crossbeam event loop arm processing latencies
+    /// Time spent processing slot updates
     pub crossbeam_slot_receiver_processing_us: Histogram,
+    /// Time spent processing packet batches
     pub crossbeam_delay_packet_receiver_processing_us: Histogram,
+    /// Time spent processing subscription requests
     pub crossbeam_subscription_receiver_processing_us: Histogram,
+    /// Time spent processing heartbeat ticks
     pub crossbeam_heartbeat_tick_processing_us: Histogram,
+    /// Time spent processing metrics collection ticks
     pub crossbeam_metrics_tick_processing_us: Histogram,
 
-    // channel stats
+    // Channel utilization statistics
+    /// Peak slot receiver channel length this period
     pub slot_receiver_max_len: usize,
+    /// Total capacity of slot receiver channel
     pub slot_receiver_capacity: usize,
+    /// Peak subscription receiver channel length this period
     pub subscription_receiver_max_len: usize,
+    /// Total capacity of subscription receiver channel
     pub subscription_receiver_capacity: usize,
+    /// Peak packet receiver channel length this period
     pub delay_packet_receiver_max_len: usize,
+    /// Total capacity of packet receiver channel
     pub delay_packet_receiver_capacity: usize,
-    pub packet_subscriptions_total_queued: usize, // sum of all items currently queued
+    /// Total items queued across all validator subscription channels
+    pub packet_subscriptions_total_queued: usize,
+    /// Per-validator packet forwarding statistics
     packet_stats_per_validator: HashMap<Pubkey, PacketForwardStats>,
 }
 
@@ -352,20 +421,38 @@ impl RelayerMetrics {
     }
 }
 
+/// Container for packet batches received from the TPU with timing information.
+/// 
+/// The timestamp enables latency tracking from packet reception through
+/// forwarding to validators.
 pub struct RelayerPacketBatches {
+    /// Timestamp when packets were received from TPU (for latency measurement)
     pub stamp: Instant,
+    /// Verified transaction packet batch from banking stage
     pub banking_packet_batch: BankingPacketBatch,
 }
 
+/// Types of subscriptions that can be registered with the relayer.
+/// 
+/// Currently only supports validator packet subscriptions, but the enum
+/// structure allows for future subscription types (e.g., metrics, health).
 pub enum Subscription {
+    /// Validator subscribing to receive transaction packet streams
     ValidatorPacketSubscription {
+        /// Validator's public key for identification and authorization
         pubkey: Pubkey,
+        /// gRPC stream sender for forwarding packets to this validator
         sender: TokioSender<Result<SubscribePacketsResponse, Status>>,
     },
 }
 
+/// Errors that can occur during relayer operation.
+/// 
+/// Currently focused on shutdown scenarios, but can be extended
+/// for other operational error conditions.
 #[derive(Error, Debug)]
 pub enum RelayerError {
+    /// Relayer is shutting down due to channel disconnection
     #[error("shutdown")]
     Shutdown(#[from] RecvError),
 }

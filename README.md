@@ -1,485 +1,391 @@
 # Jito Relayer
 
-⚡ **Low Latency Transaction Send**
+⚡ **High-Performance TPU Proxy for Solana Validators**
 
-Jito provides Solana MEV users with superior transaction execution through fast landing, MEV protection, and revert protection, available for both single transactions and multiple transactions (bundles) via gRPC and JSON-RPC services, ensuring optimal performance in the highly competitive Solana ecosystem.
+**Version**: 2.1  
+**Target Audience**: Validators, Infrastructure Engineers
 
-## What is Jito Relayer?
+---
 
-Jito Relayer acts as a transaction processing unit (TPU) proxy for Solana validators, serving as a critical component in Jito's MEV infrastructure. It forwards transactions to validators while integrating with the block engine for MEV bundle processing.
+## 📖 **Table of Contents**
 
-## 🌐 How does the system work?
+1. [Project Overview](#project-overview)
+2. [Workspace Architecture](#workspace-architecture) 
+3. [Transaction Flow](#transaction-flow)
+4. [Port Configuration](#port-configuration)
+5. [Development Guide](#development-guide)
+6. [Authentication](#authentication)
+7. [Troubleshooting](#troubleshooting)
 
-1. **Validators** run a modified Agave validator client called Jito-Solana that enables higher value capture for them and their stakers
-2. **The validator** then connects to the Jito Block-Engine and Jito-Relayer
-3. **The Block-Engine** submits profitable bundles to the validator
-4. **The Relayer** acts as a proxy to filter and verify transactions for validators
-5. **Searchers, dApps, Telegram bots** and others connect to the Block-Engine and submit transactions & bundles
-6. **Submissions** can be over gRPC or JSON-RPC
-7. **Bundles** have tips bids associated with them; these bids are then redistributed to the validators and their stakers
+---
 
-## 💼 What are bundles?
+## 🎯 **Project Overview**
 
-- **Bundles** are groups of transactions (max 5) bundled together
-- **Sequential Execution**: The transactions are executed sequentially and atomically meaning all-or-nothing
-- **MEV Strategies**: Bundles enable complex MEV strategies like atomic arbitrage
-- **Competition**: Bundles compete against other bundles on tips to the validator
+Jito Relayer is a Rust-based TPU (Transaction Processing Unit) proxy for Solana validators. Each validator runs their own instance to participate in MEV infrastructure while providing high-performance transaction forwarding.
 
-## 🔄 How do Bundles work?
+### **Core Capabilities**
+- **QUIC-based TPU Proxy**: Ultra-low latency transaction processing
+- **MEV Integration**: Direct connection to Block Engine for MEV bundle processing
+- **Authentication Services**: JWT-based validator authentication
+- **Leader Schedule Management**: Optimal transaction routing to current leaders
+- **Health Monitoring**: Built-in diagnostics and metrics
 
-1. Traders submit bundle to block engines
-2. Block engines simulate bundles to determine the most profitable combinations
-3. Winning bundles are sent to validators to include in blocks
-4. Validators execute bundles atomically and collect tips
-5. MEV rewards from bundles are distributed to validators and stakers
+### **Who Runs This**
+- **Individual Validators**: Each validator operates their own relayer instance
+- **Purpose**: Enable MEV participation and provide TPU proxy services
+- **Infrastructure**: Connects validator to broader Jito MEV ecosystem
 
-## ⚖️ What is the auction?
+## 🏗️ **Workspace Architecture**
 
-- **Priority Auction**: Bundles submitted by traders are put through a priority auction
-- **Scarcity**: An auction is needed since opportunities and blockspace are scarce
-- **Optimization**: The auction creates a stream of bundles that maximizes tips in a block
-- **Parallelism**: Parallelism in locking patterns is leveraged where possible to allow for local state auctions
-- **Timing**: Parallel auctions are run at 200ms ticks
-- **Bundle Selection**: Jito submits the highest paying combination of bundles to the validator up to some CU limit
-
-# Building
-```shell
-# pull submodules to get protobuffers required to connect to Block Engine and validator
-$ git submodule update --init --recursive
-# build from source
-$ cargo build --release
-
-run --bin jito-transaction-relayer -- \
-    --keypair-path keypair.json \
-    --signing-key-pem-path signing_key.pem \
-    --verifying-key-pem-path verifying_key.pem \
-    --rpc-servers https://api.mainnet-beta.solana.com \
-    --websocket-servers wss://api.mainnet-beta.solana.com
+### **Package Structure**
+```
+jito-relayer/
+├── block_engine/          # Block Engine client integration
+├── core/                  # Core Solana functionality (no validator deps)
+├── jito-protos/          # gRPC protocol buffer definitions
+├── relayer/              # Authentication, health, TPU proxy logic
+├── rpc/                  # RPC load balancing
+├── transaction-relayer/  # Main binary and orchestration
+├── web/                  # Web server diagnostics
+└── packet_blaster/       # Performance testing tool
 ```
 
-# Releases
+### **Component Responsibilities**
 
-## Making a release
+#### **1. transaction-relayer/** (Main Binary)
+- **Orchestration**: Coordinates all services and components
+- **CLI Configuration**: 40+ command-line options for deployment
+- **Service Management**: Manages TPU, authentication, and web services
+- **Signal Handling**: Graceful shutdown and health monitoring
 
-We opt to use cargo workspaces for making releases.
-First, install cargo workspaces by running: `cargo install cargo-workspaces`.
-Next, check out the master branch of the jito-relayer repo and 
-ensure you're on the latest commit.
-In the master branch, run the following command and follow the instructions:
-```shell
-$ ./release
+#### **2. block_engine/** (MEV Integration)
+- **Block Engine Client**: Direct gRPC connection to Jito Block Engine
+- **Packet Forwarding**: Sends transaction copies for MEV processing
+- **Authentication**: JWT-based auth with Block Engine services
+- **AOI/POI Filtering**: Accounts/Programs of Interest filtering
+
+#### **3. relayer/** (Core Proxy Logic)
+- **TPU Proxy**: QUIC-based transaction forwarding to validators
+- **Authentication Service**: Ed25519 challenge-response authentication
+- **Leader Schedule**: Caches current and future slot leaders
+- **Health Management**: Tracks system health via slot monitoring
+
+#### **4. core/** (Solana Integration)
+- **TPU Implementation**: QUIC server management and packet processing
+- **OFAC Filtering**: Compliance filtering for sanctioned addresses
+- **Solana Types**: Core blockchain functionality without validator dependencies
+
+#### **5. jito-protos/** (Protocol Definitions)
+- **gRPC Services**: Auth and Relayer service definitions
+- **Message Types**: Protocol buffer schemas for communication
+- **Client Generation**: Generated clients for service interaction
+
+### **Key Dependencies**
+- **Solana v2.1.16**: Core blockchain functionality
+- **QUIC (quinn)**: High-performance networking
+- **gRPC (tonic)**: Service communication
+- **JWT**: Authentication tokens
+- **Ed25519**: Cryptographic signatures
+
+## 🔄 **Transaction Flow**
+
+### **Dual-Path Architecture**
+
+This relayer implements a sophisticated dual-path system for transaction processing:
+
+```mermaid
+graph TD
+    A[External Clients] -->|Submit Tx| B[Local Relayer :11228]
+    
+    B -->|Process & Validate| C[Internal Processing]
+    C -->|Immediate Copy| D[Block Engine Client]
+    C -->|Delayed Forward| E[TPU Forward :11229]
+    
+    D -->|Send TO| F[Block Engine :443]
+    E -->|Send TO| G[Leader Validator TPU]
+    
+    F -->|MEV Processing| H[Bundle Auction]
+    G -->|Execute| I[Blockchain Block]
+    
+    subgraph "This Codebase"
+        B
+        C
+        D
+        E
+    end
 ```
-This will bump all the versions of the packages in your repo, 
-push to master and tag a new commit.
 
-## Running a release
-There are two options for running the relayer from releases:
-- Download the most recent release on the [releases](https://github.com/jito-foundation/jito-relayer/releases) page.
-- (Not recommended for production): One can download and run Docker containers from the Docker [registry](https://hub.docker.com/r/jitolabs/jito-transaction-relayer).
+### **Transaction Processing Steps**
 
-# API Documentation
+1. **Reception** (Port 11228): Receive transactions from clients via QUIC
+2. **Dual Forwarding** (`transaction-relayer/src/forwarder.rs`):
+   - **Immediate**: Send copy TO Block Engine for MEV processing
+   - **Delayed**: Buffer and forward TO validators after configured delay
+3. **Leader Routing**: Forward to current slot leader based on schedule
+4. **Execution**: Leader validator processes and includes in blocks
 
-## Block Engine Endpoints
+### **Code Flow (forwarder.rs)**
 
-You can send JSON-RPC requests to any Block Engine using the following URLs. To route to a specific region, specify the desired region:
+```rust
+// Immediate Block Engine forwarding (line 82)
+block_engine_sender.try_send(BlockEnginePackets {
+    banking_packet_batch: banking_packet_batch.clone(),
+    stamp: system_time,
+    expiration: packet_delay_ms,
+})
 
-| Location | Block Engine URL | Shred Receiver | Relayer URL | NTP Server |
-|----------|-----------------|----------------|-------------|------------|
-| 🌍 🌎 🌏 **Mainnet** | https://mainnet.block-engine.jito.wtf | - | - | - |
-| 🇳🇱 **Amsterdam** | https://amsterdam.mainnet.block-engine.jito.wtf | 74.118.140.240:1002 | http://amsterdam.mainnet.relayer.jito.wtf:8100 | ntp.amsterdam.jito.wtf |
-| 🇩🇪 **Frankfurt** | https://frankfurt.mainnet.block-engine.jito.wtf | 64.130.50.14:1002 | http://frankfurt.mainnet.relayer.jito.wtf:8100 | ntp.frankfurt.jito.wtf |
-| 🇬🇧 **London** | https://london.mainnet.block-engine.jito.wtf | 142.91.127.175:1002 | http://london.mainnet.relayer.jito.wtf:8100 | ntp.london.jito.wtf |
-| 🇺🇸 **New York** | https://ny.mainnet.block-engine.jito.wtf | 141.98.216.96:1002 | http://ny.mainnet.relayer.jito.wtf:8100 | ntp.dallas.jito.wtf |
-| 🇺🇸 **Salt Lake City** | https://slc.mainnet.block-engine.jito.wtf | 64.130.53.8:1002 | http://slc.mainnet.relayer.jito.wtf:8100 | ntp.slc.jito.wtf |
-| 🇸🇬 **Singapore** | https://singapore.mainnet.block-engine.jito.wtf | 202.8.11.224:1002 | http://singapore.mainnet.relayer.jito.wtf:8100 | ntp.singapore.jito.wtf |
-| 🇯🇵 **Tokyo** | https://tokyo.mainnet.block-engine.jito.wtf | 202.8.9.160:1002 | http://tokyo.mainnet.relayer.jito.wtf:8100 | ntp.tokyo.jito.wtf |
-| 🌍 🌎 🌏 **Testnet** | https://testnet.block-engine.jito.wtf | - | - | - |
-| 🇺🇸 **Dallas** | https://dallas.testnet.block-engine.jito.wtf | 141.98.218.12:1002 | http://dallas.testnet.relayer.jito.wtf:8100 | ntp.dallas.jito.wtf |
-| 🇺🇸 **New York** | https://ny.testnet.block-engine.jito.wtf | 64.130.35.224:1002 | http://ny.testnet.relayer.jito.wtf:8100 | ntp.dallas.jito.wtf |
+// Delayed validator forwarding (line 103)
+buffered_packet_batches.push_back(RelayerPacketBatches {
+    stamp: instant,
+    banking_packet_batch,
+});
+```
 
-## 📨 Transactions (/api/v1/transactions)
+### **MEV Ecosystem Integration**
 
-For single transaction-related methods, use the URL path `/api/v1/transactions`
+- **Local Relayer Role**: Acts as transaction hub feeding data to Block Engine
+- **Block Engine Processing**: MEV auctions, bundle simulation, compliance filtering
+- **Bundle Distribution**: Block Engine returns optimized bundles via separate infrastructure
+- **Revenue Sharing**: MEV rewards flow to validators and stakers
 
-### sendTransaction
+## ⚙️ **Port Configuration**
 
-This method forwards transactions directly to validators through the local relayer proxy, providing MEV protection and enhanced transaction processing.
+### **Main Application Ports**
 
-**Key Features:**
-- Direct proxy to validator TPU endpoints
-- MEV protection and revert protection
-- Bypasses standard RPC mempool for faster execution
-- Automatic `skip_preflight=true` setting
+| Port | Protocol | Service | Purpose |
+|------|----------|---------|---------|
+| **11226** | TCP/gRPC | Authentication Server | Validator authentication & API |
+| **11227** | HTTP | Web Diagnostics | Health checks & metrics |
+| **11228** | QUIC/UDP | TPU Reception | Transaction reception from clients |
+| **11229** | QUIC/UDP | TPU Forward | Transaction forwarding to validators |
 
-**Important Notes:**
-- Minimum tip requirement: 1000 lamports
-- Recommended 70/30 split: Priority fee (70%) + Jito tip (30%)
-- Enable revert protection with `bundleOnly=true` query parameter
-- Transactions are forwarded to current slot leader
+### **Port Usage Details**
 
-**Local Relayer Integration:**
-The local relayer acts as a proxy between clients and validators:
-1. Client sends transaction to local relayer (port 11228)
-2. Relayer authenticates and processes the transaction
-3. Relayer forwards to appropriate validator via QUIC
-4. Validator processes transaction with MEV protection
+#### **Port 11226 (gRPC Authentication)**
+- **Purpose**: Validator authentication and service coordination
+- **Authentication**: Ed25519 challenge-response + JWT tokens
+- **Access Control**: Only validators in leader schedule or allowlist
+- **Rate Limiting**: 1 request/second per IP by default
 
-**Request Parameters:**
-- `params` (string, required): Signed transaction as base64 (recommended) or base58 (deprecated)
-- `encoding` (string, optional): Transaction encoding format. Default: base58
+#### **Port 11228 (TPU Reception)**
+- **Purpose**: High-performance transaction reception
+- **Protocol**: QUIC for ultra-low latency
+- **Access**: Authenticated clients only (via JWT from 11226)
+- **Processing**: Immediate validation and dual-path forwarding
 
-**Example Request to Local Relayer:**
+#### **Port 11229 (TPU Forward)**
+- **Purpose**: Internal transaction forwarding to validators
+- **Target**: Current slot leader's TPU endpoints
+- **Optimization**: Direct validator TPU access bypassing RPC
+
+#### **Port 11227 (Diagnostics)**
+- **Health Check**: `curl http://localhost:11227/health`
+- **Status**: `curl http://localhost:11227/status`
+- **Metrics**: Performance and operational metrics
+
+### **External Connections**
+
+| Port | Service | Purpose |
+|------|---------|---------|
+| **8899** | Solana RPC | Blockchain state queries, leader schedule |
+| **8900** | Solana WebSocket | Real-time slot updates and events |
+| **443** | Block Engine | MEV processing and bundle submission |
+
+## 🛠️ **Development Guide**
+
+### **Prerequisites**
+- **Rust**: Nightly 2024-09-05 (specified in `rust-toolchain.toml`)
+- **System**: Linux (Ubuntu 20.04+) or macOS
+- **Memory**: 16GB+ RAM recommended
+- **Network**: Stable connection to Solana RPC endpoints
+
+### **Setup**
 ```bash
-# First, ensure your local relayer is running on port 11226
-curl http://localhost:11226/api/v1/transactions -X POST -H "Content-Type: application/json" -d '{
-  "id": 1,
-  "jsonrpc": "2.0",
-  "method": "sendTransaction",
-  "params": [
-    "AVXo5X7UNzpuOmYzkZ+fqHDGiRLTSMlWlUCcZKzEV5CIKlrdvZa3/2GrJJfPrXgZqJbYDaGiOnP99tI/sRJfiwwBAAEDRQ/n5E5CLbMbHanUG3+iVvBAWZu0WFM6NoB5xfybQ7kNwwgfIhv6odn2qTUu/gOisDtaeCW1qlwW/gx3ccr/4wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAvsInicc+E3IZzLqeA+iM5cn9kSaeFzOuClz1Z2kZQy0BAgIAAQwCAAAAAPIFKgEAAAA=",
-    {
-      "encoding": "base64"
-    }
-  ]
-}'
+# Clone and initialize
+git clone https://github.com/jito-foundation/jito-relayer.git
+cd jito-relayer
+git submodule update --init --recursive
+
+# macOS OpenSSL setup
+export OPENSSL_DIR=$(brew --prefix openssl)
+export PKG_CONFIG_PATH="$OPENSSL_DIR/lib/pkgconfig:$PKG_CONFIG_PATH"
+
+# Build
+cargo build --release
 ```
 
-**Alternative: Direct Block Engine (Production):**
+### **Configuration**
+
+#### **1. Generate Keys**
 ```bash
-# For production, use hosted block engine
-curl https://mainnet.block-engine.jito.wtf/api/v1/transactions -X POST -H "Content-Type: application/json" -d '{
-  "id": 1,
-  "jsonrpc": "2.0",
-  "method": "sendTransaction",
-  "params": [
-    "AVXo5X7UNzpuOmYzkZ+fqHDGiRLTSMlWlUCcZKzEV5CIKlrdvZa3/2GrJJfPrXgZqJbYDaGiOnP99tI/sRJfiwwBAAEDRQ/n5E5CLbMbHanUG3+iVvBAWZu0WFM6NoB5xfybQ7kNwwgfIhv6odn2qTUu/gOisDtaeCW1qlwW/gx3ccr/4wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAvsInicc+E3IZzLqeA+iM5cn9kSaeFzOuClz1Z2kZQy0BAgIAAQwCAAAAAPIFKgEAAAA=",
-    {
-      "encoding": "base64"
-    }
-  ]
-}'
-```
-
-**Response:**
-```json
-{
-  "jsonrpc": "2.0",
-  "result": "2id3YC2jK9G5Wo2phDx4gJVAew8DcY5NAojnVuao8rkxwPYPe8cSwE5GzhEgJA2y8fVjDEo6iR6ykBvDxrTQrtpb",
-  "id": 1
-}
-```
-
-**Authentication (if required):**
-```bash
-# Include authentication header for private relayers
-curl http://localhost:11226/api/v1/transactions -X POST \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -d '{ ... }'
-```
-
-## 💼 Bundles (/api/v1)
-
-Bundles are a list of up to 5 transactions that execute sequentially and atomically, ensuring an all-or-nothing outcome.
-
-### sendBundle
-
-Submits a bundled list of signed transactions to the cluster for processing. The transactions are atomically processed in order, meaning if any transaction fails, the entire bundle is rejected.
-
-**Requirements:**
-- Maximum of 5 transactions per bundle
-- A tip is necessary for the bundle to be considered
-- Use `getTipAccounts` to retrieve tip accounts
-
-**Example Request (base64):**
-```bash
-curl https://mainnet.block-engine.jito.wtf:443/api/v1/bundles -X POST -H "Content-Type: application/json" -d '{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "sendBundle",
-  "params": [
-    [
-      "AT2AqtlokikUWgGNnSX5xrmdvBjSaiIPxvFz6zc5Abn5Z0CPFW5GO+Y3rXceLnqLgQFnGw0yTk3NtJdFNsbrwwQBAAIEsXPDJ9cMVbpFQYClVM7PGLh8JOfCD6E2vz5VNmBCF+p4Uhyxec67hYm1VqLV7JTSSYaC/fm7KvWtZOSRzEFT2gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABUpTWpkpIQZNJOhxYNo4fHw1td28kruB5B+oQEEFRI1i3Wzl2VfewCI8oYXParnP78725sKFzYheTEn8v865YQIDABhqaXRvIGJ1bmRsZSAwOiBqaXRvIHRlc3QCAgABDAIAAACghgEAAAAAAA==",
-      "AS6fOZuGDsmyYdd+RC0fiFUgNe1BYTOYT+1hkRXHAeroC8R60h3g34EPF5Ys8sGzVBMP9MDSTVgy1/SSTqpCtA4BAAIEsXPDJ9cMVbpFQYClVM7PGLh8JOfCD6E2vz5VNmBCF+p4Uhyxec67hYm1VqLV7JTSSYaC/fm7KvWtZOSRzEFT2gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABUpTWpkpIQZNJOhxYNo4fHw1td28kruB5B+oQEEFRI1i3Wzl2VfewCI8oYXParnP78725sKFzYheTEn8v865YQIDABhqaXRvIGJ1bmRsZSAxOiBqaXRvIHRlc3QCAgABDAIAAACghgEAAAAAAA=="
-    ],
-    {
-      "encoding": "base64"
-    }
-  ]
-}'
-```
-
-### getBundleStatuses
-
-Returns the status of submitted bundle(s). If a bundle_id is not found or has not landed, it returns null.
-
-**Example Request:**
-```bash
-curl https://mainnet.block-engine.jito.wtf/api/v1/getBundleStatuses -X POST -H "Content-Type: application/json" -d '{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "getBundleStatuses",
-  "params": [
-    [
-      "892b79ed49138bfb3aa5441f0df6e06ef34f9ee8f3976c15b323605bae0cf51d"
-    ]
-  ]
-}'
-```
-
-### getTipAccounts
-
-Retrieves the tip accounts designated for tip payments for bundles.
-
-**Example Request:**
-```bash
-curl https://mainnet.block-engine.jito.wtf/api/v1/getTipAccounts -X POST -H "Content-Type: application/json" -d '{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "getTipAccounts",
-  "params": []
-}'
-```
-
-**Response:**
-```json
-{    
-  "jsonrpc": "2.0",
-  "result": [
-    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
-    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
-    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
-    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
-    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
-    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
-    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
-    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT"
-  ],
-  "id": 1
-}
-```
-
-## 💸 Tips and Pricing
-
-### Tip Amounts
-
-**For sendTransaction:**
-- Use a 70/30 split between priority fee and jito tip
-- Example: Priority Fee (70%): 0.7 SOL + Jito Tip (30%): 0.3 SOL = Total: 1.0 SOL
-
-**For sendBundle:**
-- Only the Jito tip matters
-- Minimum tip: 1000 lamports
-
-### Get Tip Information
-
-**REST API endpoint:**
-```bash
-curl https://bundles.jito.wtf/api/v1/bundles/tip_floor
-```
-
-**WebSocket:**
-```bash
-wscat -c wss://bundles.jito.wtf/api/v1/bundles/tip_stream
-```
-
-## 🛡️ Sandwich Mitigation
-
-Add any valid Solana public key that starts with `jitodontfront` to any instruction to prevent sandwich attacks:
-- Example: `jitodontfront111111111111111111111111111111`
-- Account doesn't need to exist on-chain but must be a valid pubkey
-- Mark the account as read-only for optimal performance
-- Works with both `sendBundle` and `sendTransaction` endpoints
-
-## 📊 Rate Limits
-
-- **Default**: 1 request per second per IP per region
-- **Exceeding limits**: 429 rate limit error
-- **Authentication**: Contact Jito for higher rate limits
-
-## 🔧 Getting Started
-
-### SDKs Available:
-- **Python**: [Jito Py JSON-RPC](https://github.com/jito-foundation/jito-py)
-- **JavaScript/TypeScript**: [Jito JS JSON-RPC](https://github.com/jito-foundation/jito-js)
-- **Rust**: [Jito Rust JSON-RPC](https://github.com/jito-foundation/jito-rust)
-- **Go**: [Jito Go JSON-RPC](https://github.com/jito-foundation/jito-go)
-
-# Running a Relayer
-See https://jito-foundation.gitbook.io/mev/jito-relayer/running-a-relayer for setup and usage instructions.
-
-## Quick Start Guide
-
-### 1. Generate Required Keys
-```bash
-# Generate Solana keypair
+# Validator identity keypair
 solana-keygen new --no-bip39-passphrase --outfile keypair.json
 
-# Generate Ed25519 signing key
+# Authentication keys
 openssl genpkey -algorithm Ed25519 -out signing_key.pem
-
-# Extract public key for verification
 openssl pkey -in signing_key.pem -pubout -out verifying_key.pem
 ```
 
-### 2. Run the Relayer
+#### **2. Run Relayer**
 ```bash
-# For local development (requires local Solana validator)
+# Basic configuration
 cargo run --bin jito-transaction-relayer -- \
     --keypair-path keypair.json \
     --signing-key-pem-path signing_key.pem \
     --verifying-key-pem-path verifying_key.pem
 
-# For mainnet connection
+# Production with MEV integration
 cargo run --bin jito-transaction-relayer -- \
     --keypair-path keypair.json \
     --signing-key-pem-path signing_key.pem \
     --verifying-key-pem-path verifying_key.pem \
     --rpc-servers https://api.mainnet-beta.solana.com \
-    --websocket-servers wss://api.mainnet-beta.sola
-    na.com
+    --websocket-servers wss://api.mainnet-beta.solana.com \
+    --block-engine-url https://amsterdam.mainnet.block-engine.jito.wtf \
+    --packet-delay-ms 200
 ```
 
-### 3. Port Configuration
-The relayer uses the following ports by default:
-- **11226** - gRPC API server (authentication, client connections)
-- **11228** - TPU QUIC socket (receives transactions from clients)
-- **11229** - TPU Forward QUIC socket (forwards transactions to validators)
-- **11227** - Web server (HTTP endpoints)
-
-### 4. Filter Logs
-To reduce verbose metrics logging:
+### **Testing**
 ```bash
-cargo run --bin jito-transaction-relayer -- [args] 2>&1 | grep -v "metrics"
+# Unit tests
+RUST_LOG=info cargo test
+
+# Load testing
+cargo run --bin packet-blaster -- \
+    --tpu-addr 127.0.0.1:11228 \
+    --num-clients 10 \
+    --packets-per-client 1000
 ```
 
-### 5. Troubleshooting
-Common connection errors when running locally:
-- `Connection refused (127.0.0.1:8899)` - No local Solana RPC server running
-- `Connection refused (127.0.0.1:8900)` - No local Solana WebSocket server running
-- `Couldn't Get Epoch Info from RPC` - Unable to fetch validator schedule
-
-Solution: Either start a local Solana validator (`solana-test-validator`) or use mainnet RPC endpoints.
-
-# Knowledge Base
-
-## Understanding Preflight in Solana Transactions
-
-**Preflight** is Solana's transaction validation mechanism that simulates and validates transactions before actual submission to the network.
-
-### What is Preflight?
-
-Preflight is a pre-execution validation process that:
-
-1. **Simulates the transaction** against current blockchain state
-2. **Checks for errors** like insufficient funds, invalid instructions, or program failures
-3. **Estimates compute units** required for execution
-4. **Validates account permissions** and ownership
-5. **Returns detailed simulation results** including logs and state changes
-
-### Standard Solana RPC Preflight Process
-
+### **Code Quality**
 ```bash
-# Standard RPC call with preflight (default behavior)
-curl -X POST https://api.mainnet-beta.solana.com -H "Content-Type: application/json" -d '{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "sendTransaction",
-  "params": [
-    "<base64_transaction>",
-    {
-      "skipPreflight": false,  # Default: runs simulation first
-      "encoding": "base64"
-    }
-  ]
-}'
+# Clippy (requires nightly)
+cargo +nightly-2024-09-05-x86_64-unknown-linux-gnu clippy --all-targets
+
+# Format
+cargo fmt
+
+# Check dependencies
+cargo +nightly-2024-09-05-x86_64-unknown-linux-gnu udeps --locked
 ```
 
-**Standard flow with preflight:**
-1. RPC node receives transaction
-2. **Simulation runs** against current state
-3. If simulation fails → transaction is rejected
-4. If simulation succeeds → transaction is submitted to TPU
-5. Returns simulation results or errors
+## 🔐 **Authentication**
 
-### Why Jito Skips Preflight
+### **Validator Authentication Flow**
 
-Jito automatically sets `skipPreflight=true` for several critical reasons:
-
-#### **1. Performance Optimization**
-```
-With Preflight:    Client → RPC → Simulate → Validate → TPU → Leader
-Without Preflight: Client → RPC → TPU → Leader (Direct)
-```
-- **Reduced Latency**: Eliminates simulation step that can take 100-500ms
-- **Faster Execution**: Direct submission to validator TPU endpoints
-- **MEV Advantage**: Critical for time-sensitive MEV opportunities
-
-#### **2. MEV-Specific Requirements**
-- **Bundle Atomicity**: MEV bundles may fail individually but succeed as a group
-- **State Dependencies**: Transactions in bundles depend on each other's execution
-- **Simulation Inaccuracy**: Preflight simulation doesn't account for bundle context
-
-#### **3. Fresh State Access**
-- **Current Leader Targeting**: Sends directly to current slot leader
-- **Reduced Congestion**: Avoids RPC node bottlenecks
-- **Real-time Execution**: No waiting in RPC node queues
-
-### Preflight vs. Skip Preflight Comparison
-
-| Aspect | With Preflight | Skip Preflight (Jito) |
-|--------|----------------|------------------------|
-| **Latency** | Higher (simulation delay) | Lower (direct submission) |
-| **Error Detection** | Early validation | Runtime detection |
-| **MEV Suitability** | Poor (state assumptions) | Optimal (real execution) |
-| **Bundle Support** | Limited (individual tx) | Full (atomic bundles) |
-| **Throughput** | Lower (simulation overhead) | Higher (direct path) |
-
-### Trade-offs of Skipping Preflight
-
-#### **Benefits:**
-- **Faster transaction submission** for time-sensitive MEV
-- **Bundle compatibility** with atomic execution
-- **Direct validator communication** bypassing RPC bottlenecks
-- **Reduced computational overhead** on transaction processing
-
-#### **Considerations:**
-- **No early error detection** - invalid transactions fail at execution
-- **Potential fee loss** if transactions fail after submission
-- **Higher responsibility** on client to validate transactions
-- **Less detailed error reporting** compared to simulation
-
-### Example: MEV Bundle Context
-
-```rust
-// MEV Bundle with interdependent transactions
-Bundle {
-  tx1: "Borrow 100 SOL from lending protocol",
-  tx2: "Swap SOL→USDC on DEX A", 
-  tx3: "Swap USDC→SOL on DEX B",
-  tx4: "Repay 100 SOL + profit to lending protocol"
-}
+#### **Step 1: Generate Challenge**
+```bash
+grpcurl -plaintext -d '{
+  "role": "VALIDATOR",
+  "pubkey": "YOUR_32_BYTE_PUBKEY_BASE64"
+}' localhost:11226 auth.AuthService/GenerateAuthChallenge
 ```
 
-**With Preflight:**
-- `tx1` simulation: ✅ Pass (can borrow)
-- `tx2` simulation: ❌ Fail (insufficient balance, doesn't see tx1 effect)
-- Bundle rejected despite being valid as a group
+#### **Step 2: Sign Challenge**
+```bash
+grpcurl -plaintext -d '{
+  "challenge": "CHALLENGE_TOKEN",
+  "client_pubkey": "YOUR_32_BYTE_PUBKEY",
+  "signed_challenge": "ED25519_SIGNATURE_64_BYTES"
+}' localhost:11226 auth.AuthService/GenerateAuthTokens
+```
 
-**Without Preflight (Jito):**
-- All transactions submitted as atomic bundle
-- Execute sequentially with state changes
-- Bundle succeeds with profitable arbitrage
+#### **Step 3: Use JWT Token**
+```bash
+grpcurl -plaintext -H "authorization: Bearer JWT_TOKEN" -d '{
+  "packets": [{"data": "SERIALIZED_TRANSACTION_BASE64"}]
+}' localhost:11226 relayer.RelayerService/SendPackets
+```
 
-### Jito's Implementation
+### **Authorization Modes**
 
-Jito hardcodes `skipPreflight=true` because:
+#### **Mode 1: Leader Schedule (Default)**
+- Only validators currently scheduled as leaders can authenticate
+- Automatically updates from Solana RPC every 10 seconds
+- No manual configuration required
 
-1. **MEV Infrastructure**: Designed for MEV use cases where preflight is counterproductive
-2. **Performance Critical**: Every millisecond matters in MEV extraction
-3. **Bundle-First Design**: Architecture assumes atomic bundle execution
-4. **Direct TPU Access**: Bypasses traditional RPC limitations
+#### **Mode 2: Explicit Allowlist**
+```bash
+--allowed-validators pubkey1,pubkey2,pubkey3
+```
 
-This design choice makes Jito optimal for MEV searchers and other performance-critical applications while requiring users to handle transaction validation on the client side.
+### **Security Features**
+- **Ed25519 Signatures**: Cryptographic authentication
+- **JWT Tokens**: Time-limited access tokens
+- **Rate Limiting**: DOS protection
+- **Challenge-Response**: Prevents replay attacks
 
+## 🚨 **Troubleshooting**
 
+### **Common Issues**
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| `Connection refused (11226)` | Relayer not running | Start relayer service |
+| `Permission denied` | Pubkey not authorized | Add to allowlist or check leader schedule |
+| `Connection refused (8899)` | No Solana RPC | Configure valid RPC endpoint |
+| `Invalid signature` | Auth failure | Verify Ed25519 keypair and signing |
+
+### **Health Monitoring**
+```bash
+# Service health
+curl http://localhost:11227/health
+
+# Detailed status
+curl http://localhost:11227/status
+
+# Check logs
+journalctl -u jito-relayer --follow
+```
+
+### **Performance Tuning**
+```bash
+# Increase TPU servers for higher throughput
+--num-tpu-quic-servers 8
+--num-tpu-fwd-quic-servers 4
+
+# Optimize packet batching
+--validator-packet-batch-size 8
+
+# Memory optimization
+export MALLOC_CONF="dirty_decay_ms:1000,muzzy_decay_ms:1000"
+```
+
+### **Network Configuration**
+```bash
+# Required firewall rules
+ufw allow 11226/tcp  # gRPC authentication
+ufw allow 11227/tcp  # Web diagnostics
+ufw allow 11228/udp  # TPU reception
+ufw allow 11229/udp  # TPU forwarding
+```
+
+## 📊 **Quick Reference**
+
+### **Essential Commands**
+```bash
+# Run relayer
+cargo run --bin jito-transaction-relayer -- --keypair-path keypair.json
+
+# Health check
+curl http://localhost:11227/health
+
+# Test authentication
+grpcurl -plaintext localhost:11226 auth.AuthService/GenerateAuthChallenge
+```
+
+### **Key Files**
+- `transaction-relayer/src/main.rs`: Main orchestration
+- `transaction-relayer/src/forwarder.rs`: Dual-path transaction forwarding
+- `relayer/src/relayer.rs`: TPU proxy and authentication
+- `block_engine/src/block_engine.rs`: Block Engine client
+
+### **Important Ports**
+- **11226**: Validator authentication (gRPC)
+- **11228**: Transaction reception (QUIC)
+- **11229**: Transaction forwarding (QUIC)
+- **11227**: Health monitoring (HTTP)
+
+---
+
+*Jito Relayer v2.1 - Open-source TPU proxy for Solana validators*

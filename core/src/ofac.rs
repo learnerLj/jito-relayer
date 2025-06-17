@@ -1,3 +1,16 @@
+//! OFAC (Office of Foreign Assets Control) compliance filtering for transactions.
+//! 
+//! This module provides functionality to detect and filter transactions that involve
+//! addresses subject to OFAC sanctions. This is critical for regulatory compliance
+//! in jurisdictions where operators must block transactions involving sanctioned entities.
+//! 
+//! The filtering supports both:
+//! - **Static addresses**: Directly specified in transaction account lists
+//! - **Dynamic addresses**: Referenced through Solana address lookup tables
+//! 
+//! When a transaction is identified as OFAC-related, it should be dropped before
+//! processing to ensure compliance with financial regulations.
+
 use std::collections::HashSet;
 
 use dashmap::DashMap;
@@ -6,7 +19,26 @@ use solana_sdk::{
     transaction::VersionedTransaction,
 };
 
-/// Returns true if transaction is ofac-related, false if not
+/// Determines if a transaction involves any OFAC-sanctioned addresses.
+/// 
+/// This function performs comprehensive scanning of both static account keys
+/// and dynamic addresses referenced through lookup tables. A transaction is
+/// considered OFAC-related if it involves a sanctioned address in any capacity:
+/// - As a signer, writable account, or readonly account
+/// - Referenced through address lookup tables
+/// - As a program ID or fee payer
+/// 
+/// # Arguments
+/// * `tx` - The versioned transaction to analyze
+/// * `ofac_addresses` - Set of known OFAC-sanctioned public keys
+/// * `address_lookup_table_cache` - Cache of address lookup tables for dynamic address resolution
+/// 
+/// # Returns
+/// `true` if the transaction involves any sanctioned addresses, `false` otherwise
+/// 
+/// # Compliance Note
+/// Operators in regulated jurisdictions should drop transactions that return `true`
+/// to maintain compliance with OFAC sanctions programs.
 pub fn is_tx_ofac_related(
     tx: &VersionedTransaction,
     ofac_addresses: &HashSet<Pubkey>,
@@ -16,7 +48,21 @@ pub fn is_tx_ofac_related(
         || is_ofac_address_in_lookup_table(tx, ofac_addresses, address_lookup_table_cache)
 }
 
-/// Returns true if an ofac address is in the static keys for an account
+/// Checks if any OFAC-sanctioned addresses appear in the transaction's static account keys.
+/// 
+/// Static account keys include:
+/// - Fee payer (always index 0)
+/// - All signers
+/// - All writable accounts
+/// - All readonly accounts
+/// - Program IDs
+/// 
+/// # Arguments
+/// * `tx` - The versioned transaction to check
+/// * `ofac_addresses` - Set of known OFAC-sanctioned public keys
+/// 
+/// # Returns
+/// `true` if any static account key matches a sanctioned address
 fn is_ofac_address_in_static_keys(
     tx: &VersionedTransaction,
     ofac_addresses: &HashSet<Pubkey>,
@@ -27,20 +73,40 @@ fn is_ofac_address_in_static_keys(
         .any(|acc| ofac_addresses.contains(acc))
 }
 
-/// Returns true if an ofac address is in the dynamic keys (lookup table) for an account
+/// Checks if any OFAC-sanctioned addresses are referenced through address lookup tables.
+/// 
+/// Solana's address lookup tables allow transactions to reference accounts indirectly
+/// to reduce transaction size. This function resolves those references and checks
+/// if any resolved addresses are sanctioned.
+/// 
+/// Only addresses that are actually referenced by the transaction (through writable_indexes
+/// or readonly_indexes) are checked - addresses that exist in the lookup table but
+/// aren't used by the transaction are ignored.
+/// 
+/// # Arguments
+/// * `tx` - The versioned transaction to check
+/// * `ofac_addresses` - Set of known OFAC-sanctioned public keys  
+/// * `address_lookup_table_cache` - Cache containing lookup table data
+/// 
+/// # Returns
+/// `true` if any referenced lookup table address matches a sanctioned address
 fn is_ofac_address_in_lookup_table(
     tx: &VersionedTransaction,
     ofac_addresses: &HashSet<Pubkey>,
     address_lookup_table_cache: &DashMap<Pubkey, AddressLookupTableAccount>,
 ) -> bool {
+    // Check if transaction uses any address lookup tables
     if let Some(lookup_tables) = tx.message.address_table_lookups() {
         for table in lookup_tables {
+            // Resolve the lookup table from cache
             if let Some(lookup_info) = address_lookup_table_cache.get(&table.account_key) {
+                // Check both writable and readonly referenced addresses
                 for idx in table
                     .writable_indexes
                     .iter()
                     .chain(table.readonly_indexes.iter())
                 {
+                    // Resolve the index to an actual address
                     if let Some(account) = lookup_info.addresses.get(*idx as usize) {
                         if ofac_addresses.contains(account) {
                             return true;

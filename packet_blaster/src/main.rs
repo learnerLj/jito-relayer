@@ -1,3 +1,30 @@
+//! # Packet Blaster
+//!
+//! A high-performance transaction stress testing tool for Solana TPU (Transaction Processing Unit).
+//! This tool generates and sends batches of transactions to test the throughput and reliability
+//! of Solana validators and relayers.
+//!
+//! The packet blaster supports multiple connection modes:
+//! - **Quic**: Standard Solana QUIC connection using the official client
+//! - **Quinn**: Custom QUIC implementation with configurable source addresses for localhost testing
+//! - **SlowLoris**: A slow-send attack mode that sends data in small chunks with delays
+//!
+//! ## Architecture
+//!
+//! The tool spawns multiple threads (one per keypair) that each:
+//! 1. Establish connections to the TPU endpoint
+//! 2. Generate batches of transfer transactions
+//! 3. Serialize and send transactions continuously
+//! 4. Track success/failure metrics and throughput
+//!
+//! ## Performance Features
+//!
+//! - Multi-threaded transaction generation and sending
+//! - Configurable batch sizes and send intervals
+//! - Real-time metrics reporting
+//! - Support for multiple source IP addresses (localhost testing)
+//! - Connection pooling and reuse
+
 use std::{
     fs, io,
     io::ErrorKind,

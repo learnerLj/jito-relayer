@@ -77,27 +77,50 @@ impl AuthInterceptor {
         }
     }
 
+    /// Extracts and validates a JWT token from the HTTP Authorization header.
+    /// 
+    /// This method performs the core JWT validation logic:
+    /// 1. Finds the Authorization header in the request metadata
+    /// 2. Validates the "Bearer " prefix format
+    /// 3. Extracts the JWT token string
+    /// 4. Verifies the token signature using the configured public key
+    /// 5. Ensures the signing algorithm matches expectations
+    /// 
+    /// # Arguments
+    /// * `meta` - gRPC request metadata containing HTTP headers
+    /// 
+    /// # Returns
+    /// A verified JWT token with decoded claims, or gRPC Status error
+    /// 
+    /// # Errors
+    /// - `invalid_argument` if header format is malformed
+    /// - `permission_denied` if token is missing, invalid, or verification fails
     fn jwt_from_header(
         &self,
         meta: &MetadataMap,
     ) -> Result<Token<Header, DeSerClaims, Verified>, Status> {
+        // Look for Authorization header in request metadata
         if let Some(auth_header) = meta.get(AUTHORIZATION_HEADER) {
+            // Convert header value to string, handling potential encoding issues
             let auth_header = auth_header.to_str().map_err(|e| {
                 warn!("error parsing authorization header {}", e);
                 Status::invalid_argument("Failed to parse authorization header.")
             })?;
 
+            // Validate Bearer token format: "Authorization: Bearer <token>"
             if !auth_header.starts_with(BEARER) {
                 return Err(Status::permission_denied(
                     "Invalid authorization header format. Must conform to `Authorization: Bearer ${token}`.",
                 ));
             }
 
+            // Extract the JWT token part after "Bearer "
             let split: Vec<&str> = auth_header.split(BEARER).collect();
             if split.len() != 2 {
                 return Err(Status::permission_denied("Missing jwt token."));
             }
 
+            // Verify the JWT token signature and decode claims
             let jwt_token: Token<Header, DeSerClaims, Verified> =
                 VerifyWithKey::verify_with_key(split[1], self.verifying_key.as_ref()).map_err(
                     |e| {
@@ -106,11 +129,13 @@ impl AuthInterceptor {
                     },
                 )?;
 
-            // This shouldn't fail since the token passed verification.
+            // Verify the signing algorithm matches our security requirements
+            // This prevents algorithm confusion attacks
             assert_eq!(jwt_token.header().algorithm, self.expected_signing_algo);
 
             Ok(jwt_token)
         } else {
+            // No Authorization header provided
             Err(Status::permission_denied(
                 "The authorization header is missing.",
             ))

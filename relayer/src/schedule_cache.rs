@@ -113,35 +113,62 @@ impl LeaderScheduleCacheUpdater {
             .unwrap()
     }
 
+    /// Fetches the current leader schedule from Solana RPC and updates the cache.
+    /// 
+    /// This method performs the actual RPC calls to get epoch info and leader schedule,
+    /// then converts the relative slot numbers to absolute slot numbers for easier lookup.
+    /// 
+    /// # Process
+    /// 1. Get current epoch info to determine slot offset
+    /// 2. Fetch leader schedule for current epoch
+    /// 3. Convert relative slots to absolute slots using epoch offset
+    /// 4. Update the shared schedule cache atomically
+    /// 
+    /// # Arguments
+    /// * `load_balancer` - RPC client pool for network requests
+    /// * `schedule` - Shared schedule cache to update
+    /// 
+    /// # Returns
+    /// `true` if update was successful, `false` if RPC calls failed
     pub fn update_leader_cache(
         load_balancer: &Arc<LoadBalancer>,
         schedule: &Arc<RwLock<HashMap<Slot, Pubkey>>>,
     ) -> bool {
+        // Get RPC client from load balancer (selects best available)
         let rpc_client = load_balancer.rpc_client();
 
+        // First, get current epoch information
         if let Ok(epoch_info) = rpc_client.get_epoch_info() {
+            // Then, get the leader schedule for current epoch
             if let Ok(Some(leader_schedule)) = rpc_client.get_leader_schedule(None) {
+                // Calculate epoch start slot for converting relative to absolute slots
                 let epoch_offset = epoch_info.absolute_slot - epoch_info.slot_index;
 
                 debug!("read leader schedule of length: {}", leader_schedule.len());
 
+                // Build new schedule mapping with absolute slot numbers
                 let mut new_schedule = HashMap::with_capacity(DEFAULT_SLOTS_PER_EPOCH as usize);
                 for (pk_str, slots) in leader_schedule.iter() {
-                    for slot in slots.iter() {
-                        if let Ok(pubkey) = Pubkey::from_str(pk_str) {
+                    // Parse validator pubkey from string
+                    if let Ok(pubkey) = Pubkey::from_str(pk_str) {
+                        // Convert each relative slot to absolute slot and add to mapping
+                        for slot in slots.iter() {
                             new_schedule.insert(*slot as u64 + epoch_offset, pubkey);
                         }
                     }
                 }
+                
+                // Atomically replace the entire schedule cache
                 *schedule.write().unwrap() = new_schedule;
 
-                return true;
+                return true; // Successful update
             } else {
                 error!("Couldn't Get Leader Schedule Update from RPC!!!")
             };
         } else {
             error!("Couldn't Get Epoch Info from RPC!!!")
         };
-        false
+        
+        false // Failed to update
     }
 }

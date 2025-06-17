@@ -56,53 +56,85 @@ use tonic::transport::Server;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+/// Command-line arguments for the Jito Transaction Relayer.
+/// The relayer acts as a high-performance TPU (Transaction Processing Unit) proxy
+/// that forwards transactions to Solana validators while integrating with the
+/// Jito Block Engine for MEV (Maximum Extractable Value) bundle processing.
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    /// DEPRECATED, will be removed in a future release.
+    /// DEPRECATED: Legacy UDP TPU port (Transaction Processing Unit)
+    /// UDP-based TPU was replaced with QUIC for better performance and reliability.
+    /// This field remains for backward compatibility but is no longer used.
     #[deprecated(since = "0.1.8", note = "UDP TPU disabled")]
     #[arg(long, env, default_value_t = 0)]
     tpu_port: u16,
 
-    /// DEPRECATED, will be removed in a future release.
+    /// DEPRECATED: Legacy UDP TPU forward port
+    /// Used for forwarding transactions to next leader. Replaced by QUIC-based forwarding.
+    /// This field remains for backward compatibility but is no longer used.
     #[deprecated(since = "0.1.8", note = "UDP TPU_FWD disabled")]
     #[arg(long, env, default_value_t = 0)]
     tpu_fwd_port: u16,
 
-    /// Port to bind to for tpu quic packets.
-    /// The TPU will bind to all ports in the range of (tpu_quic_port, tpu_quic_port + num_tpu_quic_servers).
-    /// Open firewall ports for this entire range
-    /// Make sure to not overlap any tpu forward ports with the normal tpu ports.
-    /// Note: get_tpu_configs will return ths port - 6 to validators to match old UDP TPU definition.
+    /// QUIC-based TPU port for receiving transactions from clients.
+    /// QUIC provides better performance than UDP with built-in congestion control,
+    /// multiplexing, and connection reliability. The relayer binds to a port range:
+    /// [tpu_quic_port, tpu_quic_port + num_tpu_quic_servers)
+    ///
+    /// IMPORTANT: Open firewall ports for the entire range.
+    /// IMPORTANT: Avoid overlap with TPU forward ports.
+    ///
+    /// Note: Returns (port - 6) to validators to maintain compatibility with legacy UDP TPU numbering.
     #[arg(long, env, default_value_t = 11_228)]
     tpu_quic_port: u16,
 
-    /// Number of tpu quic servers to spawn.
+    /// Number of concurrent QUIC TPU servers to spawn for load distribution.
+    /// Each server handles incoming transaction packets on its own port.
+    /// More servers can improve throughput under high load but consume more resources.
     #[arg(long, env, default_value_t = 1)]
     num_tpu_quic_servers: u16,
 
-    /// Port to bind to for tpu quic fwd packets.
-    /// Make sure to set this to at least (num_tpu_fwd_quic_servers + 6) higher than tpu_fwd_quic_port,
-    /// to avoid overlap any tpu forward ports with the normal tpu ports.
-    /// TPU_FWD will bind to all ports in the range of (tpu_fwd_quic_port, tpu_fwd_quic_port + num_tpu_fwd_quic_servers).
-    /// Open firewall ports for this entire range
-    /// Note: get_tpu_configs will return ths port - 6 to validators to match old UDP TPU definition.
+    /// QUIC-based TPU forward port for leader-to-leader transaction forwarding.
+    /// When the current relayer is not the leader, it forwards transactions to
+    /// the current leader's TPU forward port. This enables efficient transaction
+    /// propagation across the validator network.
+    ///
+    /// Port range: [tpu_quic_fwd_port, tpu_quic_fwd_port + num_tpu_fwd_quic_servers)
+    ///
+    /// IMPORTANT: Set at least (num_tpu_fwd_quic_servers + 6) higher than regular TPU ports
+    /// to avoid port conflicts. Open firewall ports for the entire range.
+    ///
+    /// Note: Returns (port - 6) to validators for UDP compatibility.
     #[arg(long, env, default_value_t = 11_229)]
     tpu_quic_fwd_port: u16,
 
-    /// Number of tpu fwd quic servers to spawn.
+    /// Number of concurrent QUIC TPU forward servers for leader-to-leader forwarding.
+    /// Multiple servers enable parallel processing of forwarded transactions
+    /// and improve resilience under high transaction volume.
     #[arg(long, env, default_value_t = 1)]
     num_tpu_fwd_quic_servers: u16,
 
-    /// Bind IP address for GRPC server
+    /// IP address for the gRPC server that exposes relayer services.
+    /// The gRPC server provides authentication endpoints and relayer configuration APIs.
+    /// Default 0.0.0.0 binds to all interfaces, allowing external connections.
+    /// Use 127.0.0.1 to restrict to localhost only for security.
     #[arg(long, env, default_value_t = IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)))]
     grpc_bind_ip: IpAddr,
 
-    /// Bind port address for GRPC server
+    /// Port for the gRPC server that exposes relayer services.
+    /// Validators connect to this port for authentication and to receive
+    /// TPU configuration information (ports, IP addresses, etc.).
     #[arg(long, env, default_value_t = 11_226)]
     grpc_bind_port: u16,
 
-    /// RPC servers as a space-separated list. Shall be same position as websocket equivalent below
+    /// List of Solana RPC server HTTP URLs for blockchain queries (space-separated).
+    /// These servers provide access to blockchain state, account data, and transaction submission.
+    /// The LoadBalancer automatically routes requests to the server with the highest slot
+    /// (most up-to-date blockchain state) for optimal MEV performance.
+    ///
+    /// IMPORTANT: Must match the order of websocket_servers (paired by position).
+    /// Example: "http://rpc1.com:8899 http://rpc2.com:8899"
     #[arg(
         long,
         env,
@@ -111,7 +143,14 @@ struct Args {
     )]
     rpc_servers: Vec<String>,
 
-    /// Websocket servers as a space-separated list. Shall be same position as RPC equivalent above
+    /// List of Solana WebSocket server URLs for real-time slot updates (space-separated).
+    /// WebSocket connections provide live blockchain slot notifications used for:
+    /// - Determining which RPC server has the most current state
+    /// - Health monitoring and system coordination
+    /// - Leader schedule updates for optimal transaction forwarding
+    ///
+    /// IMPORTANT: Must match the order of rpc_servers (paired by position).
+    /// Example: "ws://rpc1.com:8900 ws://rpc2.com:8900"
     #[arg(
         long,
         env,
@@ -120,140 +159,283 @@ struct Args {
     )]
     websocket_servers: Vec<String>,
 
+    /// Solana network entrypoint for gossip network discovery and public IP detection.
+    /// The entrypoint serves as a bootstrap node that provides:
+    /// - Access to the gossip network for validator discovery
+    /// - Public IP address detection when --public-ip is not specified
+    /// - Network topology information and cluster configuration
+    ///
+    /// The relayer contacts this entrypoint to join the Solana gossip network
+    /// and discover other validators, leader schedules, and network state.
     #[arg(long, env, default_value = "entrypoint.mainnet-beta.solana.com:8001")]
     entrypoint_address: String,
 
-    /// This is the IP address that will be shared with the validator. The validator will
-    /// tell the rest of the network to send packets here.
+    /// Public IP address that validators will advertise to the network.
+    /// This is the IP address where other network participants will send transactions.
+    /// If not specified, the relayer will automatically discover its public IP
+    /// by contacting the entrypoint address.
+    ///
+    /// CRITICAL: Must be the externally routable IP address, not localhost or private IPs.
+    /// Validators will share this IP with the entire Solana network.
     #[arg(long, env)]
     public_ip: Option<IpAddr>,
 
-    /// Packet delay in milliseconds
+    /// Intentional delay before forwarding packets to validators (milliseconds).
+    /// This delay allows the relayer to collect and batch multiple transactions
+    /// before forwarding, improving efficiency. However, it trades latency for throughput.
+    /// Lower values reduce transaction confirmation time but may increase network overhead.
     #[arg(long, env, default_value_t = 200)]
     packet_delay_ms: u32,
 
-    /// Address for Jito Block Engine.
-    /// See https://jito-labs.gitbook.io/mev/searcher-resources/block-engine#connection-details
+    /// URL of the Jito Block Engine for MEV bundle processing.
+    /// The Block Engine coordinates Maximum Extractable Value (MEV) operations
+    /// by processing transaction bundles from searchers and coordinating with validators.
+    ///
+    /// If not provided, MEV functionality is disabled and the relayer operates
+    /// in standard transaction forwarding mode only.
+    ///
+    /// See: https://jito-labs.gitbook.io/mev/searcher-resources/block-engine#connection-details
     #[arg(long, env)]
     block_engine_url: Option<String>,
 
-    /// Manual override for authentication service address of the block-engine.
-    /// Defaults to `--block-engine-url`
+    /// Override URL for the Block Engine's authentication service.
+    /// The auth service handles validator authentication and authorization for MEV operations.
+    /// If not specified, defaults to the same URL as --block-engine-url.
+    ///
+    /// Useful when the Block Engine and auth service are deployed separately
+    /// or when using different endpoints for load balancing.
     #[arg(long, env)]
     block_engine_auth_service_url: Option<String>,
 
-    /// Path to keypair file used to authenticate with the backend.
+    /// Path to the relayer's identity keypair file.
+    /// This keypair is used to:
+    /// - Authenticate with the Jito Block Engine
+    /// - Sign metrics and telemetry data
+    /// - Establish identity for validator coordination
+    ///
+    /// SECURITY: Protect this file with appropriate permissions (600).
+    /// The private key should be kept secure as it represents the relayer's identity.
     #[arg(long, env)]
     keypair_path: PathBuf,
 
-    /// Validators allowed to authenticate and connect to the relayer, comma separated.
-    /// If null then all validators on the leader schedule shall be permitted.
+    /// Whitelist of validator public keys allowed to authenticate with this relayer.
+    /// Restricts access to only specified validators for enhanced security.
+    /// Use comma-separated list of base58-encoded pubkeys.
+    ///
+    /// If not specified (null), all validators in the current leader schedule
+    /// are automatically permitted to authenticate. This is the typical configuration
+    /// for open relayers that serve the entire validator set.
+    ///
+    /// Example: "pubkey1,pubkey2,pubkey3"
     #[arg(long, env, value_delimiter = ',')]
     allowed_validators: Option<Vec<Pubkey>>,
 
-    /// The private key used to sign tokens by this server.
+    /// Path to PEM-encoded private key file for JWT token signing.
+    /// This key is used by the authentication service to sign access tokens
+    /// and refresh tokens issued to authenticated validators.
+    ///
+    /// SECURITY: Must be kept secure with restricted file permissions (600).
+    /// Compromise of this key allows unauthorized token generation.
     #[arg(long, env)]
     signing_key_pem_path: PathBuf,
 
-    /// The public key used to verify tokens by this and other services.
+    /// Path to PEM-encoded public key file for JWT token verification.
+    /// This key is used to verify the authenticity of tokens presented by validators.
+    /// Multiple services can share this public key for distributed token verification.
+    ///
+    /// Must correspond to the private key specified in signing_key_pem_path.
     #[arg(long, env)]
     verifying_key_pem_path: PathBuf,
 
-    /// Specifies how long access_tokens are valid for, expressed in seconds.
+    /// Time-to-live for access tokens in seconds (default: 30 minutes).
+    /// Access tokens are short-lived credentials that validators use for API calls.
+    /// Shorter TTL improves security but requires more frequent token refresh.
+    /// Longer TTL reduces refresh overhead but increases security risk if compromised.
     #[arg(long, env, default_value_t = 1_800)]
     access_token_ttl_secs: u64,
 
-    /// Specifies how long access_tokens are valid for, expressed in seconds.
+    /// Time-to-live for refresh tokens in seconds (default: 50 hours).
+    /// Refresh tokens are used to obtain new access tokens without re-authentication.
+    /// Much longer-lived than access tokens to reduce authentication overhead.
+    /// Should be long enough to cover typical validator restart/maintenance cycles.
     #[arg(long, env, default_value_t = 180_000)]
     refresh_token_ttl_secs: u64,
 
-    /// Specifies how long challenges are valid for, expressed in seconds.
+    /// Time-to-live for authentication challenges in seconds (default: 30 minutes).
+    /// Challenges are cryptographic puzzles sent to validators during initial auth.
+    /// Must be long enough for validators to process but short enough to prevent replay attacks.
+    /// Expired challenges are automatically cleaned up to prevent memory leaks.
     #[arg(long, env, default_value_t = 1_800)]
     challenge_ttl_secs: u64,
 
-    /// The interval at which challenges are checked for expiration.
+    /// Interval for cleaning up expired authentication challenges (seconds).
+    /// Background task runs at this interval to remove stale challenges from memory.
+    /// Should be frequent enough to prevent memory buildup but not so frequent
+    /// as to impact performance. Default 3 minutes provides good balance.
     #[arg(long, env, default_value_t = 180)]
     challenge_expiration_sleep_interval_secs: u64,
 
-    /// How long it takes to miss a slot for the system to be considered unhealthy
+    /// Slot miss threshold for marking the system as unhealthy (seconds).
+    /// If no slot updates are received within this timeframe, the health
+    /// manager marks the system as unhealthy, which affects metrics and
+    /// potentially triggers alerts.
+    ///
+    /// Solana produces slots every ~400ms, so 10 seconds allows for significant
+    /// network issues while avoiding false positives.
     #[arg(long, env, default_value_t = 10)]
     missing_slot_unhealthy_secs: u64,
 
-    /// DEPRECATED. Solana cluster name (mainnet-beta, testnet, devnet, ...)
+    /// DEPRECATED: Solana cluster identifier (mainnet-beta, testnet, devnet, etc.).
+    /// Originally used for metrics and regional coordination but no longer functional.
+    /// Retained for backward compatibility only.
     #[arg(long, env)]
     cluster: Option<String>,
 
-    /// DEPRECATED. Region (amsterdam, dallas, frankfurt, ...)
+    /// DEPRECATED: Geographic region identifier (amsterdam, dallas, frankfurt, etc.).
+    /// Originally used for latency optimization and regional metrics but no longer used.
+    /// Retained for backward compatibility only.
     #[arg(long, env)]
     region: Option<String>,
 
-    /// Accounts of interest cache TTL. Note this must play nicely with the refresh period that
-    /// block engine uses to send full updates.
+    /// Cache TTL for "Accounts of Interest" used in MEV bundle processing (seconds).
+    /// The Block Engine tracks specific accounts that are frequently accessed in MEV bundles.
+    /// This cache reduces RPC load by temporarily storing account states.
+    ///
+    /// IMPORTANT: Must coordinate with Block Engine's full update refresh period
+    /// to avoid stale data inconsistencies. Default 5 minutes balances performance and freshness.
     #[arg(long, env, default_value_t = 300)]
     aoi_cache_ttl_secs: u64,
 
-    /// How frequently to refresh the address lookup table accounts
+    /// Interval for refreshing Solana address lookup tables (seconds).
+    /// Address lookup tables compress transaction sizes by storing frequently used addresses.
+    /// Regular refresh ensures the relayer has current lookup table data for transaction processing.
+    /// Only active when enable_lookup_table_refresh is true.
     #[arg(long, env, default_value_t = 600)]
     lookup_table_refresh_secs: u64,
 
-    /// Enables lookup table refreshes
+    /// Enable automatic refresh of address lookup table data from RPC servers.
+    /// When enabled, periodically fetches all address lookup tables to keep local cache current.
+    /// Improves transaction processing efficiency but increases RPC load.
+    /// Recommended for high-throughput relayers handling many compressed transactions.
     #[arg(long, env, default_value_t = false)]
     enable_lookup_table_refresh: bool,
 
-    /// Space-separated addresses to drop transactions for OFAC
-    /// If any transaction mentions these addresses, the transaction will be dropped.
+    /// List of addresses subject to OFAC sanctions (space-separated pubkeys).
+    /// Transactions involving any of these addresses will be automatically dropped
+    /// for regulatory compliance. This includes transactions that:
+    /// - Send/receive from these addresses
+    /// - Interact with programs owned by these addresses
+    /// - Reference these addresses in any capacity
+    ///
+    /// COMPLIANCE: Operators in regulated jurisdictions should maintain this list current.
     #[arg(long, env, value_delimiter = ' ', value_parser = Pubkey::from_str)]
     ofac_addresses: Option<Vec<Pubkey>>,
 
-    /// Webserver bind address that exposes diagnostic information
+    /// Bind address for the diagnostic web server.
+    /// Exposes health metrics, system status, and operational information via HTTP endpoints.
+    /// Used for monitoring, alerting, and operational visibility.
+    /// Default binds to localhost only for security.
     #[arg(long, env, default_value_t = SocketAddr::from_str("127.0.0.1:11227").unwrap())]
     webserver_bind_addr: SocketAddr,
 
-    /// Max unstaked connections for the QUIC server
+    /// Maximum concurrent QUIC connections from unstaked validators.
+    /// Unstaked validators have lower priority and resource allocation.
+    /// Lower limit prevents unstaked validators from overwhelming the relayer
+    /// and ensures resources are available for staked validators.
     #[arg(long, env, default_value_t = 500)]
     max_unstaked_quic_connections: usize,
 
-    /// Max unstaked connections for the QUIC server
+    /// Maximum concurrent QUIC connections from staked validators.
+    /// Staked validators get higher priority and resource allocation.
+    /// Higher limit ensures staked validators can always connect and participate
+    /// in consensus without connection limits becoming a bottleneck.
     #[arg(long, env, default_value_t = 2000)]
     max_staked_quic_connections: usize,
 
-    /// Number of packets to send in each packet batch to the validator
+    /// Number of transaction packets to batch together when forwarding to validators.
+    /// Larger batches improve network efficiency and reduce syscall overhead
+    /// but may increase latency. Smaller batches reduce latency but increase overhead.
+    /// Default 4 provides good balance for typical network conditions.
     #[arg(long, env, default_value_t = 4)]
     validator_packet_batch_size: usize,
 
-    /// Disable Mempool forwarding
+    /// Disable forwarding transactions to the mempool/gossip network.
+    /// When true, transactions are only forwarded directly to current leaders
+    /// and not broadcast to the wider network. This can improve performance
+    /// for MEV-focused operations but may reduce transaction propagation.
     #[arg(long, env, default_value_t = false)]
     disable_mempool: bool,
 
-    /// Forward all received packets to all connected validators,
-    /// regardless of leader schedule.  
-    /// Note: This is required to be true for Stake Weighted Quality of Service (SWQOS)!
+    /// Forward transactions to ALL connected validators regardless of leader schedule.
+    /// When true, ignores leader schedule and broadcasts to all validators.
+    ///
+    /// IMPORTANT: Required for Stake Weighted Quality of Service (SWQOS) functionality.
+    /// Improves transaction propagation but increases network traffic significantly.
+    /// Use with caution on bandwidth-limited connections.
     #[arg(long, env, default_value_t = false)]
     forward_all: bool,
 
-    /// Staked Nodes Overrides Path
-    /// Provide path to a yaml file with custom overrides for stakes of specific
-    ///  identities. Overriding the amount of stake this validator considers as valid
-    ///  for other peers in network. The stake amount is used for calculating the
-    ///  number of QUIC streams permitted from the peer and vote packet sender stage.
-    ///  Format of the file: `staked_map_id: {<pubkey>: <SOL stake amount>}
+    /// Path to YAML file containing custom stake overrides for network validators.
+    ///
+    /// BACKGROUND: In Solana, validators must "stake" SOL tokens to participate in consensus.
+    /// Higher stake = more influence and higher priority for network resources.
+    /// The relayer needs to know each validator's stake amount to make resource allocation decisions.
+    ///
+    /// This file allows manual override of stake amounts when:
+    /// - RPC stake data is unreliable or stale
+    /// - Testing with custom stake configurations
+    /// - Adjusting priorities for specific validators
+    ///
+    /// Stake amounts are used for:
+    /// - Maximum QUIC connections allowed from each validator
+    /// - Transaction forwarding priority (higher stake = higher priority)
+    /// - Vote packet processing order in consensus
+    ///
+    /// File format (YAML):
+    /// ```yaml
+    /// staked_map_id:
+    ///   "validator_pubkey_1": 1000000
+    ///   "validator_pubkey_2": 500000
+    ///   "validator_pubkey_3": 2000000
+    /// ```
     #[arg(long, env)]
     staked_nodes_overrides: Option<PathBuf>,
 
-    /// The slot lookahead to use when forwarding transactions
+    /// Number of slots to look ahead when determining transaction forwarding targets.
+    /// Larger values provide more time for leader schedule calculation and network
+    /// coordination but may reduce responsiveness to leader changes.
+    /// Default 5 slots (~2 seconds) balances predictability with responsiveness.
     #[arg(long, env, default_value_t = 5)]
     slot_lookahead: u64,
 }
 
+/// Container for all QUIC socket bindings used by the TPU system.
+/// Separates socket creation from socket usage for better resource management.
 #[derive(Debug)]
 struct Sockets {
+    /// QUIC sockets for transaction processing and forwarding.
+    /// Includes both regular TPU sockets and TPU forward sockets.
     tpu_sockets: TpuSockets,
 }
 
+/// Creates and binds all QUIC sockets needed for TPU operations.
+///
+/// This function:
+/// 1. Validates port ranges don't overlap
+/// 2. Binds QUIC sockets for both regular TPU and TPU forwarding
+/// 3. Ensures all sockets are successfully bound before returning
+///
+/// # Panics
+/// - If too many servers are requested (> u16::MAX)
+/// - If port ranges overlap
+/// - If socket binding fails
 fn get_sockets(args: &Args) -> Sockets {
+    // Validate server counts are within reasonable bounds
     assert!(args.num_tpu_quic_servers < u16::MAX);
     assert!(args.num_tpu_fwd_quic_servers < u16::MAX);
 
+    // Calculate port ranges for regular TPU and TPU forwarding
+    // Each server gets its own port for load distribution
     let tpu_ports = Range {
         start: args.tpu_quic_port,
         end: args
@@ -269,16 +451,20 @@ fn get_sockets(args: &Args) -> Sockets {
             .unwrap(),
     };
 
+    // Ensure port ranges don't overlap to prevent binding conflicts
     for tpu_port in tpu_ports.start..tpu_ports.end {
         assert!(!tpu_fwd_ports.contains(&tpu_port));
     }
 
+    // Bind regular TPU QUIC sockets for incoming transactions
+    // Each socket binds to a specific port in the calculated range
     let (tpu_p, tpu_quic_sockets): (Vec<_>, Vec<_>) = (0..args.num_tpu_quic_servers)
         .map(|i| {
+            // Bind to a single port within the range for this server instance
             let (port, mut sock) = multi_bind_in_range(
-                IpAddr::V4(Ipv4Addr::from([0, 0, 0, 0])),
+                IpAddr::V4(Ipv4Addr::from([0, 0, 0, 0])), // Bind to all interfaces
                 (tpu_ports.start + i, tpu_ports.start + 1 + i),
-                1,
+                1, // Request exactly 1 socket
             )
             .unwrap();
 
@@ -286,12 +472,15 @@ fn get_sockets(args: &Args) -> Sockets {
         })
         .unzip();
 
+    // Bind TPU forward QUIC sockets for leader-to-leader transaction forwarding
+    // Similar process but for the forward port range
     let (tpu_fwd_p, tpu_fwd_quic_sockets): (Vec<_>, Vec<_>) = (0..args.num_tpu_fwd_quic_servers)
         .map(|i| {
+            // Bind to a single port within the forward range for this server instance
             let (port, mut sock) = multi_bind_in_range(
-                IpAddr::V4(Ipv4Addr::from([0, 0, 0, 0])),
+                IpAddr::V4(Ipv4Addr::from([0, 0, 0, 0])), // Bind to all interfaces
                 (tpu_fwd_ports.start + i, tpu_fwd_ports.start + 1 + i),
-                1,
+                1, // Request exactly 1 socket
             )
             .unwrap();
 
@@ -299,6 +488,7 @@ fn get_sockets(args: &Args) -> Sockets {
         })
         .unzip();
 
+    // Verify that we bound to exactly the ports we expected
     assert_eq!(tpu_ports.collect::<Vec<_>>(), tpu_p);
     assert_eq!(tpu_fwd_ports.collect::<Vec<_>>(), tpu_fwd_p);
 
@@ -310,19 +500,37 @@ fn get_sockets(args: &Args) -> Sockets {
     }
 }
 
+/// Main entry point for the Jito Transaction Relayer.
+///
+/// The relayer operates as a high-performance TPU proxy that:
+/// 1. Receives transactions from clients via QUIC
+/// 2. Authenticates validators using JWT tokens
+/// 3. Forwards transactions to current leaders based on slot timing
+/// 4. Integrates with Jito Block Engine for MEV bundle processing
+/// 5. Provides health monitoring and operational metrics
+///
+/// Architecture:
+/// - Multi-threaded design with async gRPC services
+/// - QUIC-based transaction ingestion for high throughput
+/// - Real-time slot tracking for optimal forwarding decisions
+/// - JWT-based authentication with challenge-response protocol
+/// - Optional MEV integration via Block Engine connection
 fn main() {
+    // Rate limiting configuration for the diagnostic web server
     const MAX_BUFFERED_REQUESTS: usize = 10;
     const REQUESTS_PER_SECOND: u64 = 5;
 
-    // one can override the default log level by setting the env var RUST_LOG
+    // Initialize logging with millisecond timestamps for operational debugging
+    // Default log level is 'info' but can be overridden with RUST_LOG environment variable
     env_logger::Builder::from_env(Env::new().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
 
+    // Parse command-line arguments and environment variables
     let args: Args = Args::parse();
     info!("args: {:?}", args);
 
-    // Warn about deprecated args
+    // Issue deprecation warnings for legacy arguments
     if args.cluster.is_some() {
         warn!("--cluster arg is deprecated and may be removed in the next release.")
     }
@@ -330,9 +538,12 @@ fn main() {
         warn!("--region arg is deprecated and may be removed in the next release.")
     }
 
+    // Determine the public IP address that will be advertised to the network
     let public_ip = if args.public_ip.is_some() {
+        // Use explicitly provided public IP
         args.public_ip.unwrap()
     } else {
+        // Auto-discover public IP by contacting the Solana entrypoint
         let entrypoint = solana_net_utils::parse_host_port(args.entrypoint_address.as_str())
             .expect("parse entrypoint");
         info!(
@@ -343,6 +554,8 @@ fn main() {
     };
 
     info!("public ip: {:?}", public_ip);
+
+    // Validate that the public IP is suitable for network operations
     assert!(
         public_ip.is_ipv4(),
         "Your public IP address needs to be IPv4 but is currently listed as {}. \
@@ -355,9 +568,9 @@ fn main() {
         "Your public IP can't be the loopback interface"
     );
 
-    // Supporting IPV6 addresses is a DOS vector since they are cheap and there's a much larger amount of them.
-    // The DOS is specifically with regards to the challenges queue filling up and starving other legitimate
-    // challenge requests.
+    // IPv4-only restriction for security: IPv6 addresses are cheap to generate
+    // in large quantities, which could be used to overwhelm the authentication
+    // challenge queue and create a denial-of-service attack vector.
     assert!(args.grpc_bind_ip.is_ipv4(), "must bind to IPv4 address");
 
     let sockets = get_sockets(&args);
@@ -448,6 +661,8 @@ fn main() {
         None
     };
 
+    // Load validator stake overrides from YAML file if provided
+    // This allows manual control over validator resource allocation priorities
     let staked_nodes_overrides = match args.staked_nodes_overrides {
         None => StakedNodesOverrides::default(),
         Some(p) => {

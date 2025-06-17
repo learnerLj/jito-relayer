@@ -1,3 +1,24 @@
+//! JWT-based authentication service for validator access control.
+//! 
+//! This service implements a secure challenge-response authentication system:
+//! 
+//! ## Authentication Flow
+//! 1. **Challenge Generation**: Validator requests challenge for their public key
+//! 2. **Identity Verification**: Validator signs challenge with their private key  
+//! 3. **Token Issuance**: Server verifies signature and issues JWT access/refresh tokens
+//! 4. **Token Refresh**: Long-lived refresh tokens can generate new access tokens
+//! 
+//! ## Security Features
+//! - **DOS Protection**: One challenge per IP address prevents flooding attacks
+//! - **Signature Verification**: Cryptographic proof of validator identity
+//! - **Token Binding**: Tokens tied to specific IP addresses and validator pubkeys
+//! - **Automatic Expiration**: Challenges and tokens expire to limit exposure
+//! - **Authorization Control**: Only whitelisted validators can authenticate
+//! 
+//! ## Token Types
+//! - **Access Tokens**: Short-lived (typically minutes), used for API authentication
+//! - **Refresh Tokens**: Long-lived (typically hours/days), used to renew access tokens
+
 use std::{
     cmp::Reverse,
     net::IpAddr,
@@ -31,44 +52,93 @@ use crate::{
     health_manager::HealthState,
 };
 
+/// Trait for validator authorization control.
+/// 
+/// Implementations determine which validator public keys are allowed to authenticate.
+/// This enables flexible authorization policies like whitelists, stake requirements,
+/// or integration with external authorization systems.
 pub trait ValidatorAuther: Send + Sync + 'static {
+    /// Checks if a validator public key is authorized to use this relayer.
+    /// 
+    /// # Arguments
+    /// * `pubkey` - The validator's public key to check
+    /// 
+    /// # Returns
+    /// `true` if the validator is authorized, `false` otherwise
     fn is_authorized(&self, pubkey: &Pubkey) -> bool;
 }
 
+/// Implementation of the gRPC authentication service.
+/// 
+/// This service handles the complete authentication lifecycle from challenge generation
+/// through token issuance and refresh. It maintains security through cryptographic
+/// signature verification and prevents DOS attacks through rate limiting.
+/// 
+/// # Generic Parameters
+/// * `V` - Validator authorization implementation (e.g., whitelist, stake-based)
 pub struct AuthServiceImpl<V: ValidatorAuther> {
+    /// Authorization policy for determining which validators can authenticate
     validator_auther: V,
 
+    /// Background task handle for periodic challenge cleanup
     _t_hdl: JoinHandle<()>,
 
-    /// Keeps track of generated challenges. Generating a challenge requires no authentication which
-    /// opens up a DOS vector. In order to mitigate we'll allow one challenge per IP, so that an
-    /// attacker would be required to rent many IPs to overload the system. Using a PQ where items
-    /// priority is based on age. This makes expiring items more efficient since we don't need to
-    /// iterate over the entire collection.
-    ///
-    /// NOTE: The order is reversed so that older (lesser) timestamps are prioritized.
+    /// Active authentication challenges indexed by IP address.
+    /// 
+    /// Uses a priority queue to efficiently expire old challenges and prevent DOS attacks:
+    /// - One challenge per IP address limits attack surface
+    /// - Priority ordering by expiration time enables efficient cleanup
+    /// - Reverse ordering ensures oldest challenges are removed first
     auth_challenges: AuthChallenges,
 
-    /// The key used to sign JWT access & refresh tokens.
+    /// RSA private key for signing JWT tokens.
+    /// Used to create cryptographically secure access and refresh tokens.
     signing_key: PKeyWithDigest<Private>,
-    /// The key used to verify tokens. This same key must be shared with all services that
-    /// perform token based auth.
+    
+    /// RSA public key for token verification.
+    /// Shared with all services that need to validate JWT tokens.
+    /// Must correspond to the signing_key for proper token validation.
     verifying_key: Arc<PKeyWithDigest<Public>>,
 
-    /// Each token's respective TTLs.
+    /// Time-to-live for access tokens (typically short, e.g., 15 minutes).
+    /// Short TTL limits exposure if tokens are compromised.
     access_token_ttl: Duration,
+    
+    /// Time-to-live for refresh tokens (typically longer, e.g., 24 hours).
+    /// Longer TTL reduces re-authentication frequency while maintaining security.
     refresh_token_ttl: Duration,
 
-    /// How long challenges are valid for DOS mitigation purposes.
+    /// Time-to-live for authentication challenges (typically very short, e.g., 5 minutes).
+    /// Short TTL prevents challenge accumulation and DOS attacks.
     challenge_ttl: Duration,
 
+    /// Shared health state - authentication is disabled when relayer is unhealthy
     health_state: Arc<RwLock<HealthState>>,
 }
 
-// The capacity of the auth_challenges map.
+/// Maximum number of concurrent authentication challenges allowed.
+/// 
+/// This limit prevents DOS attacks through challenge flooding. With one challenge
+/// per IP address, an attacker would need 100,000 unique IP addresses to exhaust
+/// this capacity, making such attacks prohibitively expensive.
 const AUTH_CHALLENGES_CAPACITY: usize = 100_000;
 
 impl<V: ValidatorAuther> AuthServiceImpl<V> {
+    /// Creates a new authentication service with the specified configuration.
+    /// 
+    /// # Arguments
+    /// * `validator_auther` - Authorization policy for validator access control
+    /// * `signing_key` - RSA private key for signing JWT tokens
+    /// * `verifying_key` - RSA public key for token verification (shared with other services)
+    /// * `access_token_ttl` - Lifetime for access tokens (short-lived)
+    /// * `refresh_token_ttl` - Lifetime for refresh tokens (longer-lived)
+    /// * `challenge_ttl` - Lifetime for authentication challenges (very short)
+    /// * `challenge_expiration_sleep_interval` - How often to clean up expired challenges
+    /// * `exit` - Shutdown signal for graceful termination
+    /// * `health_state` - Shared health status (auth disabled when unhealthy)
+    /// 
+    /// # Returns
+    /// A new authentication service ready to handle gRPC requests
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         validator_auther: V,
@@ -81,7 +151,10 @@ impl<V: ValidatorAuther> AuthServiceImpl<V> {
         exit: &Arc<AtomicBool>,
         health_state: Arc<RwLock<HealthState>>,
     ) -> Self {
+        // Initialize empty challenge storage
         let auth_challenges = AuthChallenges::default();
+        
+        // Start background task to periodically clean up expired challenges
         let _t_hdl = Self::start_challenge_expiration_task(
             auth_challenges.clone(),
             challenge_expiration_sleep_interval,
@@ -94,6 +167,7 @@ impl<V: ValidatorAuther> AuthServiceImpl<V> {
             signing_key,
             verifying_key,
             _t_hdl,
+            // Convert standard durations to chrono durations for timestamp arithmetic
             access_token_ttl: Duration::from_std(access_token_ttl).unwrap(),
             refresh_token_ttl: Duration::from_std(refresh_token_ttl).unwrap(),
             challenge_ttl: Duration::from_std(challenge_ttl).unwrap(),
@@ -101,6 +175,18 @@ impl<V: ValidatorAuther> AuthServiceImpl<V> {
         }
     }
 
+    /// Starts a background task to periodically clean up expired authentication challenges.
+    /// 
+    /// This prevents memory leaks and DOS attacks by removing challenges that have passed
+    /// their expiration time. The task runs until the service is shut down.
+    /// 
+    /// # Arguments
+    /// * `auth_challenges` - Shared challenge storage to clean up
+    /// * `sleep_interval` - How frequently to run cleanup (e.g., every 30 seconds)
+    /// * `exit` - Shutdown signal to stop the background task
+    /// 
+    /// # Returns
+    /// Task handle for the background cleanup task
     fn start_challenge_expiration_task(
         auth_challenges: AuthChallenges,
         sleep_interval: StdDuration,
@@ -109,15 +195,30 @@ impl<V: ValidatorAuther> AuthServiceImpl<V> {
         let exit = exit.clone();
         tokio::task::spawn(async move {
             let mut interval = interval(sleep_interval);
+            
+            // Continue cleanup until shutdown signal
             while !exit.load(Ordering::Relaxed) {
-                let _ = interval.tick().await;
-                auth_challenges.remove_all_expired().await;
+                let _ = interval.tick().await; // Wait for next cleanup interval
+                auth_challenges.remove_all_expired().await; // Clean up expired challenges
             }
         })
     }
 
-    // NOTE: if this is behind a proxy, the remote_addr will be the proxy, which may mess with the
-    // authentication scheme
+    /// Extracts the client's IP address from a gRPC request.
+    /// 
+    /// The IP address is used for DOS protection (one challenge per IP) and token binding.
+    /// 
+    /// # Security Note
+    /// If this service is behind a proxy, the remote_addr will be the proxy's IP,
+    /// not the actual client IP. This could weaken DOS protection since all requests
+    /// would appear to come from the proxy IP. Consider using X-Forwarded-For headers
+    /// in proxy deployments.
+    /// 
+    /// # Arguments
+    /// * `req` - The gRPC request containing connection information
+    /// 
+    /// # Returns
+    /// The client's IP address, or internal error if unavailable
     fn client_ip<T>(req: &Request<T>) -> Result<IpAddr, Status> {
         Ok(req
             .remote_addr()
@@ -125,15 +226,33 @@ impl<V: ValidatorAuther> AuthServiceImpl<V> {
             .ip())
     }
 
+    /// Generates a cryptographically random challenge string.
+    /// 
+    /// The challenge is a 9-character alphanumeric string that validators must sign
+    /// to prove control of their private key. The randomness prevents replay attacks
+    /// and ensures each authentication session is unique.
+    /// 
+    /// # Returns
+    /// A random 9-character alphanumeric challenge string
     fn generate_challenge_token() -> String {
         rand::thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(9)
-            .map(char::from)
-            .collect()
+            .sample_iter(&Alphanumeric)  // Use cryptographically secure random generator
+            .take(9)                     // 9 characters provides sufficient uniqueness
+            .map(char::from)             // Convert bytes to characters
+            .collect()                   // Assemble into string
     }
 
-    /// Prevent validators from authenticating if the relayer is unhealthy
+    /// Checks relayer health and prevents authentication when unhealthy.
+    /// 
+    /// When the relayer is unhealthy (e.g., disconnected from Solana network),
+    /// new authentications are rejected to prevent validators from connecting
+    /// to a non-functional service. Existing connections are also dropped.
+    /// 
+    /// # Arguments
+    /// * `health_state` - Shared health status of the relayer
+    /// 
+    /// # Returns
+    /// `Ok(())` if healthy, or gRPC internal error if unhealthy
     fn check_health(health_state: &Arc<RwLock<HealthState>>) -> Result<(), Status> {
         if *health_state.read().unwrap() != HealthState::Healthy {
             Err(Status::internal("relayer is unhealthy"))
